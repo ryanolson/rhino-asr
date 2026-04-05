@@ -1,0 +1,11 @@
+[package]
+name = "rhino-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rhino-protocol.workspace = true
+rhino-engine.workspace = true
+rhino-backend.workspace = true
+anyhow.workspace = true

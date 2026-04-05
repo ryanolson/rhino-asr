@@ -1,0 +1,13 @@
+[package]
+name = "rhino-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rhino-client"
+path = "src/main.rs"
+
+[dependencies]
+rhino-protocol.workspace = true
+anyhow.workspace = true

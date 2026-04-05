@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/protocol",
+    "crates/engine",
+    "crates/vad",
+    "crates/backend",
+    "crates/service",
+    "crates/client",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ryanolson/rhino-asr"
+
+[workspace.dependencies]
+# Local crates
+rhino-protocol = { path = "crates/protocol", version = "0.1.0" }
+rhino-engine = { path = "crates/engine", version = "0.1.0" }
+rhino-vad = { path = "crates/vad", version = "0.1.0" }
+rhino-backend = { path = "crates/backend", version = "0.1.0" }
+rhino-service = { path = "crates/service", version = "0.1.0" }
+
+# Velo (local path — not published)
+velo = { path = "../velo/lib/velo" }
+velo-streaming = { path = "../velo/lib/velo-streaming" }
+velo-messenger = { path = "../velo/lib/velo-messenger" }
+velo-common = { path = "../velo/lib/velo-common" }
+velo-transports = { path = "../velo/lib/velo-transports" }
+
+# External
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }

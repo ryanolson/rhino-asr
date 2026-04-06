@@ -6,6 +6,7 @@ members = [
     "crates/backend",
     "crates/service",
     "crates/client",
+    "crates/web",
 ]
 resolver = "3"
 
@@ -22,6 +23,7 @@ rhino-engine = { path = "crates/engine", version = "0.1.0" }
 rhino-vad = { path = "crates/vad", version = "0.1.0" }
 rhino-backend = { path = "crates/backend", version = "0.1.0" }
 rhino-service = { path = "crates/service", version = "0.1.0" }
+rhino-client = { path = "crates/client", version = "0.1.0" }
 
 # Velo (local path — not published)
 velo = { path = "../velo/lib/velo" }
@@ -49,3 +51,5 @@ tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
 futures = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }

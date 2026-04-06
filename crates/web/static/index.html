@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dynamo Whisper</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>Dynamo Whisper</h1>
+      <p class="subtitle">Streaming speech recognition powered by LocalAgreement-2</p>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="cards" id="cards">
+      <div class="card" id="card-upload">
+        <div class="card-icon">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <h2>File Upload</h2>
+        <p>Drop or select an audio file for streaming transcription</p>
+        <div class="drop-zone" id="drop-zone">
+          <span>Drop audio file here or click to browse</span>
+          <input type="file" id="file-input" accept="audio/*" hidden>
+        </div>
+      </div>
+
+      <div class="card" id="card-mic">
+        <div class="card-icon">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+            <line x1="8" y1="23" x2="16" y2="23"/>
+          </svg>
+        </div>
+        <h2>Live Microphone</h2>
+        <p>Capture audio from your microphone for real-time transcription</p>
+        <button class="btn" id="btn-mic">Start Recording</button>
+      </div>
+    </section>
+
+    <section class="transcript-area" id="transcript-area">
+      <div class="transcript-header">
+        <span class="status" id="status">Connecting...</span>
+        <button class="btn btn-stop" id="btn-stop">Stop</button>
+      </div>
+      <div class="transcript" id="transcript">
+        <span id="committed"></span>
+        <span id="interim"></span>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

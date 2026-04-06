@@ -113,12 +113,14 @@ Client ────────────────────────�
 
 ---
 
-## Phase 5.1: Axum Web Service + WASM Frontend — PENDING
+## Phase 5.1: Axum Web Service + Browser Frontend — COMPLETE
 
-**Goal:** Browser-based streaming transcription via Axum + WASM.
-
-- **Axum service**: hosts WASM app, accepts WebSocket connections, bridges WebSocket ↔ client library ↔ ASR server, manages per-connection ASR sessions
-- **WASM app**: file drop (upload audio, see streaming transcription) + mic capture (browser MediaStream → live transcription in browser)
+**What was built:**
+- **Web crate** (`rhino-web`): Library + binary. Axum HTTP server with WebSocket endpoint (`/ws`). Bridges each WebSocket connection 1:1 to an ASR session via `AsrClient`. Typed WS protocol: client sends `{"type":"config",...}` then binary f32 LE PCM audio, then `{"type":"end_audio"}` to signal completion (keeps WS open for server to drain events including `EndOfUtterance`, then server closes). `ClientMessage` serde enum parses all client text frames; unknown types rejected. `ServeDir` fallback serves static frontend. CLI: `--connect-file`, `--bind`, `--static-dir`.
+- **Browser frontend** (vanilla JS, not WASM): Dynamo-blog-inspired card layout with dark header, NVIDIA green accents. Two cards: **File Upload** (drag-and-drop + file picker, `decodeAudioData` → stereo-to-mono mixing → 100ms-paced f32 chunks over WebSocket) and **Live Microphone** (`getUserMedia` → AudioWorklet with ScriptProcessor fallback → chunked streaming). JS `TextBuffer` port mirrors Rust `TextBuffer`. Committed text + italic interim display with streaming status indicator. Stop button sends graceful `end_audio`, waits for final transcription.
+- **Session state management**: `activeSession` object created before `ws.onopen`; callbacks mutate properties in-place (`interval`, `processor`, `buffer`) so `stopSession()` always has live handles. Buffer stored on session object (not local variable) to avoid stale-closure bugs. `ws.onclose`/`ws.onerror` are session-scoped — only clear `activeSession` if the closing socket matches the current session, preventing old-socket close from clobbering a replacement session.
+- **Design deviations**: (1) WASM replaced with vanilla JS — only logic to port was `TextBuffer` (~25 LOC). No wasm-pack/wasm-bindgen toolchain needed. (2) Explicit `end_audio` message instead of WS close for audio completion — WS close handshake prevents server from sending remaining events.
+- 7 unit tests (`bytes_to_f32` roundtrip/empty/truncation, `ClientMessage` config/end_audio/no-language/reject-unknown) + 6 integration tests (full WS lifecycle, 48kHz resampling, close without audio, close before config, static file serving, session replacement without interference). Total workspace: 74 tests.
 
 ### Verification
 - Open browser, drop audio file, see streaming transcription

@@ -1,0 +1,39 @@
+[package]
+name = "rhino-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rhino_web"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rhino-web"
+path = "src/main.rs"
+
+[dependencies]
+rhino-client.workspace = true
+rhino-protocol.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+rhino-backend.workspace = true
+rhino-engine.workspace = true
+rhino-service.workspace = true
+loom-rs.workspace = true
+velo.workspace = true
+velo-transports.workspace = true
+tokio-tungstenite = "0.28"
+reqwest = { version = "0.12", default-features = false }
+uuid.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,1 +1,5 @@
-// Phase 3-4: Service crate — ASR pipeline + velo session management
+pub mod pipeline;
+pub mod session;
+
+pub use pipeline::{AsrPipeline, PipelineConfig};
+pub use session::{register_handlers, SessionManager};

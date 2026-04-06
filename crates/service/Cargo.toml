@@ -9,3 +9,22 @@ rhino-protocol.workspace = true
 rhino-engine.workspace = true
 rhino-backend.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+velo.workspace = true
+loom-rs.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+
+# Binary-only deps (kept unconditional for simplicity)
+velo-transports.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bin]]
+name = "rhino-server"
+path = "src/bin/server.rs"

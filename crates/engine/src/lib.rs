@@ -43,12 +43,16 @@ impl Default for AgreementConfig {
 /// Algorithm (Macháček et al., 2023 — "Turning Whisper into Real-Time"):
 ///
 /// Each inference step over the growing audio buffer produces a hypothesis H_t.
-/// A word at position i is "confirmed" if it agrees across `min_agreement`
-/// consecutive hypotheses. Confirmed words that aren't too close to the
-/// buffer edge (lookahead) are committed.
+/// `agreement[i]` counts consecutive observations at position i: the first
+/// observation starts at 1, and each matching subsequent observation
+/// increments the count. A word is "confirmed" when `agreement[i] >= k`.
+/// For LA-2 (k=2), that means two consecutive identical hypotheses suffice.
 ///
 /// Self-correction: if the confirmed prefix diverges from previously
 /// committed words, Retract(n) + Commit(corrected) events are emitted.
+/// Retraction only occurs when there IS a confirmed prefix that differs —
+/// absence of confirmed words (e.g., after hypothesis reset) does not
+/// trigger retraction.
 pub struct AgreementEngine {
     config: AgreementConfig,
     prev_hypothesis: Vec<WordHypothesis>,
@@ -87,9 +91,10 @@ impl AgreementEngine {
             {
                 self.agreement[i] += 1;
             } else {
-                // Position diverges — reset everything from here onwards.
+                // Position diverges — start a new observation streak from here.
+                // Set to 1 (this observation is the first in the new streak).
                 for j in i..words.len() {
-                    self.agreement[j] = 0;
+                    self.agreement[j] = 1;
                 }
                 break;
             }
@@ -151,10 +156,19 @@ impl AgreementEngine {
         events
     }
 
-    /// Reset all state for a new utterance.
-    pub fn reset(&mut self) {
+    /// Clear positional tracking (hypothesis and agreement counters)
+    /// without clearing committed words.
+    ///
+    /// Use when audio buffer positions become invalid (e.g., forced trim)
+    /// but previously committed words should be retained.
+    pub fn clear_hypothesis(&mut self) {
         self.prev_hypothesis.clear();
         self.agreement.clear();
+    }
+
+    /// Reset all state for a new utterance.
+    pub fn reset(&mut self) {
+        self.clear_hypothesis();
         self.committed.clear();
     }
 
@@ -164,7 +178,18 @@ impl AgreementEngine {
     }
 
     /// Compute Commit/Retract events to bring `self.committed` in line with `target`.
+    ///
+    /// When `target` is empty and committed words exist, no retraction occurs.
+    /// An empty target means "no confirmed words yet" (insufficient observations),
+    /// not "all words are wrong." Retraction is deferred until a non-empty
+    /// confirmed prefix provides evidence of what the correct words are.
     fn reconcile_commit(&mut self, target: &[&str]) -> Vec<EngineEvent> {
+        // No confirmed words yet — don't retract what we have.
+        // Committed words stay stable until there's a confirmed replacement.
+        if target.is_empty() {
+            return Vec::new();
+        }
+
         // Find common prefix between committed and target.
         let common = self
             .committed
@@ -228,23 +253,15 @@ mod tests {
             commit_lookahead_secs: 1.0,
         });
 
-        // First hypothesis — nothing committed yet (agreement = 0).
+        // First hypothesis — agreement = 1 (first observation).
         let events = engine.push_hypothesis(
             hyp(&[("hello", 0.5), ("world", 1.0), ("test", 2.5)]),
             4.0,
         );
-        // Only interim since no agreement yet.
+        // Only interim since agreement(1) < k(2).
         assert!(events.iter().all(|e| matches!(e, EngineEvent::Interim(_))));
 
-        // Second hypothesis — same words → agreement = 1 (still < k=2).
-        let events = engine.push_hypothesis(
-            hyp(&[("hello", 0.5), ("world", 1.0), ("test", 2.5)]),
-            4.0,
-        );
-        // agreement hits 1 for all, but k=2 so still not committed.
-        assert!(events.iter().all(|e| matches!(e, EngineEvent::Interim(_))));
-
-        // Third hypothesis — agreement = 2 = k, commit words within lookahead.
+        // Second hypothesis — same words → agreement = 2 = k, commit.
         // buffer_duration=4.0, lookahead=1.0, cutoff=3.0
         // "hello" end=0.5 < 3.0 ✓, "world" end=1.0 < 3.0 ✓, "test" end=2.5 < 3.0 ✓
         let events = engine.push_hypothesis(
@@ -262,10 +279,10 @@ mod tests {
             commit_lookahead_secs: 1.0,
         });
 
-        // Three identical hypotheses → agreement = 2.
+        // Two identical hypotheses → agreement = 2 = k.
         // buffer_duration=2.0, cutoff=1.0
         // "hello" end=0.5 < 1.0 ✓, "world" end=1.5 >= 1.0 ✗
-        for _ in 0..3 {
+        for _ in 0..2 {
             engine.push_hypothesis(
                 hyp(&[("hello", 0.5), ("world", 1.5)]),
                 2.0,
@@ -282,8 +299,8 @@ mod tests {
             commit_lookahead_secs: 0.5,
         });
 
-        // Build up agreement and commit "hello world".
-        for _ in 0..3 {
+        // Two identical hypotheses → agreement = 2, commit "hello world".
+        for _ in 0..2 {
             engine.push_hypothesis(
                 hyp(&[("hello", 0.5), ("world", 1.0)]),
                 5.0,
@@ -292,8 +309,9 @@ mod tests {
         assert_eq!(engine.committed_text(), &["hello", "world"]);
 
         // Now whisper changes its mind — "world" becomes "there".
-        // The confirmed prefix shrinks to just ["hello"], so "world" is
-        // immediately retracted even though "there" isn't committed yet.
+        // Position 0 ("hello") still matches → agreement increments.
+        // Position 1 diverges → agreement[1] = 1 (new observation).
+        // Confirmed prefix = ["hello"] (agreement >= 2). "world" is retracted.
         let events = engine.push_hypothesis(
             hyp(&[("hello", 0.5), ("there", 1.0)]),
             5.0,
@@ -301,14 +319,7 @@ mod tests {
         assert!(events.contains(&EngineEvent::Retract(1)));
         assert_eq!(engine.committed_text(), &["hello"]);
 
-        // Second push with "there" — agreement[1] = 1, not enough yet.
-        engine.push_hypothesis(
-            hyp(&[("hello", 0.5), ("there", 1.0)]),
-            5.0,
-        );
-        assert_eq!(engine.committed_text(), &["hello"]);
-
-        // Third push — agreement[1] = 2 = k, "there" gets committed.
+        // Second push with "there" — agreement[1] = 2 = k, commit.
         let events = engine.push_hypothesis(
             hyp(&[("hello", 0.5), ("there", 1.0)]),
             5.0,
@@ -336,7 +347,7 @@ mod tests {
     fn reset_clears_state() {
         let mut engine = AgreementEngine::new(AgreementConfig::default());
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             engine.push_hypothesis(
                 hyp(&[("hello", 0.5)]),
                 5.0,
@@ -379,5 +390,44 @@ mod tests {
         let mut engine = AgreementEngine::new(AgreementConfig::default());
         let events = engine.push_hypothesis(vec![], 1.0);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn clear_hypothesis_preserves_committed() {
+        let mut engine = AgreementEngine::new(AgreementConfig {
+            min_agreement: 2,
+            commit_lookahead_secs: 0.5,
+        });
+
+        // Two pushes → commit "hello world" (LA-2).
+        for _ in 0..2 {
+            engine.push_hypothesis(
+                hyp(&[("hello", 0.5), ("world", 1.0)]),
+                5.0,
+            );
+        }
+        assert_eq!(engine.committed_text(), &["hello", "world"]);
+
+        // Clear hypothesis tracking but keep committed.
+        engine.clear_hypothesis();
+        assert_eq!(engine.committed_text(), &["hello", "world"]);
+
+        // First push after clear: agreement = 1, no confirmed words.
+        // Reconcile guard: empty target → no retraction. Committed preserved.
+        let events = engine.push_hypothesis(
+            hyp(&[("hello", 0.5), ("world", 1.0), ("test", 1.5)]),
+            5.0,
+        );
+        assert!(!events.iter().any(|e| matches!(e, EngineEvent::Retract(_))));
+        assert_eq!(engine.committed_text(), &["hello", "world"]);
+
+        // Second push: agreement = 2 = k. Confirmed = ["hello", "world", "test"].
+        // Reconcile: common prefix is ["hello", "world"], commit "test".
+        let events = engine.push_hypothesis(
+            hyp(&[("hello", 0.5), ("world", 1.0), ("test", 1.5)]),
+            5.0,
+        );
+        assert!(events.contains(&EngineEvent::Commit("test".into())));
+        assert_eq!(engine.committed_text(), &["hello", "world", "test"]);
     }
 }

@@ -1,5 +1,5 @@
 pub mod pipeline;
 pub mod session;
 
-pub use pipeline::{AsrPipeline, PipelineConfig};
-pub use session::{VadFactory, register_handlers, SessionManager};
+pub use pipeline::{AsrPipeline, UtteranceConfig, UtterancePipeline, StreamingConfig, StreamingPipeline};
+pub use session::{PipelineFactory, VadFactory, register_handlers, SessionManager};

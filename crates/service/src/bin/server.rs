@@ -7,8 +7,10 @@ use clap::Parser;
 use velo::{StreamConfig, Velo};
 use velo_transports::tcp::TcpTransportBuilder;
 
-
-use rhino_service::{PipelineConfig, SessionManager, register_handlers};
+use rhino_service::{
+    AsrPipeline, PipelineFactory, SessionManager, StreamingConfig, UtteranceConfig,
+    UtterancePipeline, StreamingPipeline, register_handlers,
+};
 
 #[derive(Parser)]
 #[command(name = "rhino-server", about = "Streaming ASR server")]
@@ -46,9 +48,20 @@ struct Args {
     beam_size: i32,
 
     /// Enable diagnostic one-shot transcription on each session flush
-    /// (captures audio to /tmp and compares against streaming output)
     #[arg(long)]
     diagnostic: bool,
+
+    /// Pipeline mode: "utterance" (default) or "streaming"
+    #[arg(long, default_value = "utterance")]
+    mode: String,
+
+    /// Chunk interval in seconds for utterance mode (0 to disable)
+    #[arg(long, default_value = "8.0")]
+    chunk_interval: f32,
+
+    /// Step interval in seconds for streaming mode
+    #[arg(long, default_value = "0.5")]
+    step_interval: f32,
 }
 
 fn main() -> Result<()> {
@@ -108,7 +121,12 @@ fn main() -> Result<()> {
             }
         };
 
-        match &args.model_path {
+        // Build pipeline factory based on mode + backend.
+        let mode = args.mode.clone();
+        let chunk_interval = args.chunk_interval;
+        let step_interval = args.step_interval;
+
+        let pipeline_factory: PipelineFactory = match &args.model_path {
             #[cfg(feature = "whisper")]
             Some(model_path) => {
                 use rhino_backend::whisper::{WhisperBackend, WhisperConfig, load_whisper_context};
@@ -132,22 +150,10 @@ fn main() -> Result<()> {
                 };
 
                 let ctx_clone = Arc::clone(&ctx);
-                let manager = Arc::new({
-                    let mut m = SessionManager::new(
-                        Arc::new(move || {
-                            WhisperBackend::new(Arc::clone(&ctx_clone), config.clone())
-                                .expect("failed to create whisper backend")
-                        }),
-                        PipelineConfig::default(),
-                    )
-                    .with_diagnostic(args.diagnostic);
-                    if let Some(factory) = vad_factory {
-                        m = m.with_vad(factory, rhino_vad::VadConfig::default());
-                    }
-                    m
-                });
-
-                register_handlers(&velo, &manager)?;
+                make_pipeline_factory(mode, chunk_interval, step_interval, move || {
+                    WhisperBackend::new(Arc::clone(&ctx_clone), config.clone())
+                        .expect("failed to create whisper backend")
+                })
             }
             #[cfg(not(feature = "whisper"))]
             Some(_) => {
@@ -156,29 +162,58 @@ fn main() -> Result<()> {
             None => {
                 use rhino_backend::MockBackend;
                 tracing::info!("no --model-path, using MockBackend");
-
-                let manager = Arc::new({
-                    let mut m = SessionManager::new(
-                        Arc::new(MockBackend::new),
-                        PipelineConfig::default(),
-                    )
-                    .with_diagnostic(args.diagnostic);
-                    if let Some(factory) = vad_factory {
-                        m = m.with_vad(factory, rhino_vad::VadConfig::default());
-                    }
-                    m
-                });
-
-                register_handlers(&velo, &manager)?;
+                make_pipeline_factory(mode, chunk_interval, step_interval, MockBackend::new)
             }
-        }
+        };
+
+        tracing::info!(
+            mode = %args.mode,
+            chunk_interval = args.chunk_interval,
+            step_interval = args.step_interval,
+            "pipeline mode configured"
+        );
+
+        let manager = Arc::new({
+            let mut m = SessionManager::new(pipeline_factory)
+                .with_diagnostic(args.diagnostic);
+            if let Some(factory) = vad_factory {
+                m = m.with_vad(factory, rhino_vad::VadConfig::default());
+            }
+            m
+        });
+
+        register_handlers(&velo, &manager)?;
 
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down");
 
-        // Clean up connection file.
         let _ = std::fs::remove_file(&args.connect_file);
 
         Ok(())
+    })
+}
+
+/// Build a `PipelineFactory` that creates the right pipeline type based on mode.
+fn make_pipeline_factory<B>(
+    mode: String,
+    chunk_interval: f32,
+    step_interval: f32,
+    backend_factory: impl Fn() -> B + Send + Sync + 'static,
+) -> PipelineFactory
+where
+    B: rhino_backend::AsrBackend + 'static,
+{
+    Arc::new(move || -> Box<dyn AsrPipeline> {
+        let backend = backend_factory();
+        match mode.as_str() {
+            "streaming" => Box::new(StreamingPipeline::new(backend, StreamingConfig {
+                step_secs: step_interval,
+                ..StreamingConfig::default()
+            })),
+            _ => Box::new(UtterancePipeline::new(backend, UtteranceConfig {
+                chunk_interval_secs: if chunk_interval <= 0.0 { None } else { Some(chunk_interval) },
+                ..UtteranceConfig::default()
+            })),
+        }
     })
 }

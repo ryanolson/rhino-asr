@@ -13,6 +13,7 @@ silero = ["rhino-vad/silero"]
 [dependencies]
 rhino-protocol.workspace = true
 rhino-backend.workspace = true
+rhino-engine.workspace = true
 rhino-vad.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

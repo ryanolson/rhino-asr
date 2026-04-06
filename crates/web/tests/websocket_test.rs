@@ -11,7 +11,10 @@ use rhino_backend::mock::MockBackend;
 use rhino_backend::WordToken;
 
 use rhino_protocol::AsrEvent;
-use rhino_service::{PipelineConfig, SessionManager, register_handlers};
+use rhino_service::{
+    AsrPipeline, PipelineFactory, SessionManager, UtteranceConfig, UtterancePipeline,
+    register_handlers,
+};
 
 use rhino_client::AsrClient;
 use rhino_web::{AppState, build_router};
@@ -35,10 +38,19 @@ fn token(word: &str, start: f32, end: f32) -> WordToken {
     }
 }
 
-fn test_pipeline_config() -> PipelineConfig {
-    PipelineConfig {
-        max_buffer_secs: 30.0,
-    }
+/// Build a pipeline factory from a MockBackend factory.
+fn mock_pipeline_factory(
+    backend_factory: impl Fn() -> MockBackend + Send + Sync + 'static,
+) -> PipelineFactory {
+    Arc::new(move || -> Box<dyn AsrPipeline> {
+        Box::new(UtterancePipeline::new(
+            backend_factory(),
+            UtteranceConfig {
+                max_buffer_secs: 30.0,
+                chunk_interval_secs: None,
+            },
+        ))
+    })
 }
 
 async fn make_pair() -> (Arc<Velo>, Arc<Velo>) {
@@ -69,13 +81,23 @@ async fn make_pair() -> (Arc<Velo>, Arc<Velo>) {
 /// Start an ASR server + Axum web server, return the web server URL.
 async fn start_web_server(
     backend_factory: Arc<dyn Fn() -> MockBackend + Send + Sync>,
-) -> (String, Arc<SessionManager<MockBackend>>) {
+) -> (String, Arc<SessionManager>) {
     let (server_velo, client_velo) = make_pair().await;
 
-    let manager = Arc::new(SessionManager::new(
-        backend_factory,
-        test_pipeline_config(),
-    ));
+    let pipeline_factory: PipelineFactory = {
+        let bf = backend_factory.clone();
+        Arc::new(move || -> Box<dyn AsrPipeline> {
+            Box::new(UtterancePipeline::new(
+                bf(),
+                UtteranceConfig {
+                    max_buffer_secs: 30.0,
+                    chunk_interval_secs: None,
+                },
+            ))
+        })
+    };
+
+    let manager = Arc::new(SessionManager::new(pipeline_factory));
     register_handlers(&server_velo, &manager).unwrap();
 
     let client = AsrClient::from_velo(client_velo, server_velo.instance_id());
@@ -188,8 +210,7 @@ fn websocket_session_lifecycle() {
     });
 }
 
-/// Verify the WS bridge correctly passes audio at non-16kHz sample rates
-/// (the AudioSender resamples internally).
+/// Verify the WS bridge correctly passes audio at non-16kHz sample rates.
 #[test]
 fn websocket_with_48khz_audio() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -216,7 +237,6 @@ fn websocket_with_48khz_audio() {
         let (ws, _) = connect_async(&url).await.unwrap();
         let (mut ws_tx, mut ws_rx) = ws.split();
 
-        // Config with 48kHz — browser-typical sample rate
         ws_tx
             .send(Message::Text(
                 r#"{"type":"config","sample_rate":48000,"language":"en"}"#.into(),
@@ -224,7 +244,6 @@ fn websocket_with_48khz_audio() {
             .await
             .unwrap();
 
-        // Send 3 seconds at 48kHz
         for _ in 0..3 {
             let chunk = vec![0.0f32; 48_000];
             ws_tx
@@ -234,7 +253,6 @@ fn websocket_with_48khz_audio() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Signal end of audio
         ws_tx
             .send(Message::Text(r#"{"type":"end_audio"}"#.into()))
             .await
@@ -279,14 +297,9 @@ fn websocket_close_without_audio() {
             .await
             .unwrap();
 
-        // Close immediately — no audio sent
         ws_tx.close().await.unwrap();
 
         let events = collect_events(&mut ws_rx).await;
-
-        // No audio means no transcription, but should not crash.
-        // May or may not get EndOfUtterance depending on pipeline flush behavior.
-        // The key assertion is that it doesn't hang or panic.
         let _ = events;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -313,7 +326,6 @@ fn websocket_close_before_config() {
         let (ws, _) = connect_async(&url).await.unwrap();
         let (mut ws_tx, _ws_rx) = ws.split();
 
-        // Close without ever sending config
         ws_tx.close().await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -326,15 +338,13 @@ async fn start_http_server_with_static() -> String {
     let (server_velo, client_velo) = make_pair().await;
 
     let manager = Arc::new(SessionManager::new(
-        Arc::new(MockBackend::new),
-        test_pipeline_config(),
+        mock_pipeline_factory(MockBackend::new),
     ));
     register_handlers(&server_velo, &manager).unwrap();
 
     let client = AsrClient::from_velo(client_velo, server_velo.instance_id());
     let state = AppState { client, model_info: "test".into() };
 
-    // Use the real static directory
     let static_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
     let app = build_router(state, &static_dir);
 
@@ -365,25 +375,21 @@ fn static_files_served() {
         let base_url = start_http_server_with_static().await;
         let http = reqwest::Client::new();
 
-        // index.html served at root
         let resp = http.get(&format!("{base_url}/index.html")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         assert!(body.contains("Dynamo Whisper"), "index.html should contain title");
 
-        // app.js
         let resp = http.get(&format!("{base_url}/app.js")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         assert!(body.contains("TextBuffer"), "app.js should contain TextBuffer class");
 
-        // style.css
         let resp = http.get(&format!("{base_url}/style.css")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         assert!(body.contains("#76b900"), "style.css should contain NVIDIA green");
 
-        // audio-worklet.js
         let resp = http.get(&format!("{base_url}/audio-worklet.js")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
@@ -392,8 +398,7 @@ fn static_files_served() {
 }
 
 /// Simulate session replacement: start session A, send audio, then start session B
-/// before A's WS closes. Verify B completes independently and the server handles
-/// both sessions without interference.
+/// before A's WS closes.
 #[test]
 fn session_replacement_no_interference() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -417,7 +422,7 @@ fn session_replacement_no_interference() {
         }))
         .await;
 
-        // --- Session A: start streaming, send some audio ---
+        // --- Session A ---
         let (ws_a, _) = connect_async(&url).await.unwrap();
         let (mut tx_a, mut rx_a) = ws_a.split();
 
@@ -431,11 +436,10 @@ fn session_replacement_no_interference() {
             .await
             .unwrap();
 
-        // Wait for session A to be fully created
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(manager.session_count(), 1);
 
-        // --- Session B: start immediately (simulates user clicking new file) ---
+        // --- Session B ---
         let (ws_b, _) = connect_async(&url).await.unwrap();
         let (mut tx_b, mut rx_b) = ws_b.split();
 
@@ -445,19 +449,17 @@ fn session_replacement_no_interference() {
         .await
         .unwrap();
 
-        // Wait for session B to be fully created
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(manager.session_count(), 2);
 
-        // --- Close session A (old session) via end_audio ---
+        // --- Close A ---
         tx_a.send(Message::Text(r#"{"type":"end_audio"}"#.into()))
             .await
             .unwrap();
 
-        // Drain A's events
         let _events_a = collect_events(&mut rx_a).await;
 
-        // --- Session B: send audio and complete independently ---
+        // --- Complete B ---
         for _ in 0..3 {
             tx_b.send(Message::Binary(f32_to_bytes(&vec![0.0f32; 16_000]).into()))
                 .await
@@ -471,7 +473,6 @@ fn session_replacement_no_interference() {
 
         let events_b = collect_events(&mut rx_b).await;
 
-        // Session B must complete normally with full event lifecycle
         assert!(!events_b.is_empty(), "session B should produce events");
         assert!(
             matches!(events_b.last(), Some(AsrEvent::EndOfUtterance)),

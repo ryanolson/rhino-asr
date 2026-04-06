@@ -8,14 +8,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use velo::{Handler, StreamAnchor, StreamFrame, StreamSender, TypedContext, Velo};
 
-use rhino_backend::AsrBackend;
 use rhino_protocol::{
     AsrEvent, AudioChunk, CreateSessionRequest, CreateSessionResponse, DestroySessionRequest,
     DestroySessionResponse,
 };
 use rhino_vad::{VadConfig, VadGate, VadProcessor, VadTransition};
 
-use crate::pipeline::{AsrPipeline, PipelineConfig};
+use crate::pipeline::AsrPipeline;
 
 /// How long `destroy_session` waits for the session task before detaching it.
 /// In-flight `spawn_compute` (Whisper inference) cannot be cancelled, so this
@@ -30,8 +29,8 @@ struct SessionHandle {
 }
 
 /// Bundles all sync state that moves in/out of `spawn_compute`.
-struct PipelineState<B: AsrBackend> {
-    pipeline: AsrPipeline<B>,
+struct PipelineState {
+    pipeline: Box<dyn AsrPipeline>,
     vad: Option<Box<dyn VadProcessor>>,
     gate: VadGate,
     vad_buffer: Vec<f32>,
@@ -41,7 +40,7 @@ struct PipelineState<B: AsrBackend> {
     diagnostic: bool,
 }
 
-impl<B: AsrBackend> PipelineState<B> {
+impl PipelineState {
     /// Process an audio chunk through VAD gate + pipeline.
     ///
     /// When VAD is present, audio is chunked into VAD-sized pieces and gated
@@ -57,7 +56,7 @@ impl<B: AsrBackend> PipelineState<B> {
 
         let Some(ref mut vad) = self.vad else {
             // No VAD — buffer everything directly.
-            self.pipeline.push_audio(samples);
+            self.pipeline.push_audio(samples)?;
             return Ok(vec![]);
         };
 
@@ -87,16 +86,16 @@ impl<B: AsrBackend> PipelineState<B> {
             }
 
             if self.gate.is_speech() {
-                self.pipeline.push_audio(&chunk);
+                // push_audio may return events (streaming mode: LA-2 Commit/Retract/Interim).
+                events.extend(self.pipeline.push_audio(&chunk)?);
 
-                // Long utterance split: if buffer exceeds max, flush now.
-                // This handles continuous speech without pauses (monologues).
+                // Safety net: if buffer exceeds max, flush chunk (no EndOfUtterance).
                 if self.pipeline.buffer_full() {
                     tracing::info!(
                         buf_secs = format!("{:.1}", self.pipeline.buffer_duration_secs()),
                         "long utterance split"
                     );
-                    events.extend(self.pipeline.flush_utterance()?);
+                    events.extend(self.pipeline.flush_chunk()?);
                 }
             }
         }
@@ -108,13 +107,11 @@ impl<B: AsrBackend> PipelineState<B> {
     fn flush(&mut self) -> Result<Vec<AsrEvent>> {
         // Process any leftover audio in the VAD buffer.
         if self.vad.is_some() && !self.vad_buffer.is_empty() {
-            // Pad remaining samples to chunk size and process.
             let chunk_size = self.vad.as_ref().unwrap().chunk_size();
             let remaining = std::mem::take(&mut self.vad_buffer);
             if remaining.len() < chunk_size {
                 let mut padded = remaining;
                 padded.resize(chunk_size, 0.0);
-                // Process but ignore VAD result — we're flushing.
                 let _ = self.vad.as_mut().unwrap().process_chunk(&padded);
             }
         }
@@ -143,7 +140,6 @@ impl<B: AsrBackend> PipelineState<B> {
             "diagnostic: captured audio"
         );
 
-        // Write WAV file.
         let wav_path = format!("/tmp/rhino-capture-{}.wav", std::process::id());
         match write_wav_f32(&wav_path, &samples, 16_000) {
             Ok(()) => tracing::info!(path = %wav_path, "diagnostic: wrote capture WAV"),
@@ -153,7 +149,6 @@ impl<B: AsrBackend> PipelineState<B> {
             }
         }
 
-        // One-shot transcription of the full buffer.
         match self.pipeline.transcribe_raw(&samples) {
             Ok(tokens) => {
                 let text: String = tokens.iter().map(|t| t.word.as_str()).collect::<Vec<_>>().join(" ");
@@ -173,25 +168,23 @@ impl<B: AsrBackend> PipelineState<B> {
 /// Factory type for creating VAD processors per session.
 pub type VadFactory = Arc<dyn Fn() -> Result<Box<dyn VadProcessor>> + Send + Sync>;
 
+/// Factory type for creating pipeline instances per session.
+pub type PipelineFactory = Arc<dyn Fn() -> Box<dyn AsrPipeline> + Send + Sync>;
+
 /// Manages the lifecycle of all active ASR sessions.
-pub struct SessionManager<B: AsrBackend> {
+pub struct SessionManager {
     sessions: Arc<DashMap<Uuid, SessionHandle>>,
-    backend_factory: Arc<dyn Fn() -> B + Send + Sync>,
-    pipeline_config: PipelineConfig,
+    pipeline_factory: PipelineFactory,
     vad_factory: Option<VadFactory>,
     vad_config: VadConfig,
     diagnostic: bool,
 }
 
-impl<B: AsrBackend + 'static> SessionManager<B> {
-    pub fn new(
-        backend_factory: Arc<dyn Fn() -> B + Send + Sync>,
-        pipeline_config: PipelineConfig,
-    ) -> Self {
+impl SessionManager {
+    pub fn new(pipeline_factory: PipelineFactory) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
-            backend_factory,
-            pipeline_config,
+            pipeline_factory,
             vad_factory: None,
             vad_config: VadConfig::default(),
             diagnostic: false,
@@ -214,13 +207,6 @@ impl<B: AsrBackend + 'static> SessionManager<B> {
     }
 
     /// Create a new ASR session.
-    ///
-    /// Creates an audio anchor for receiving audio, attaches as sender to the
-    /// client's event anchor, spawns the session loop, and returns handles.
-    ///
-    /// `request.config` is accepted for forward compatibility but not yet applied:
-    /// `language` requires WhisperBackend (Phase 6), `sample_rate` requires
-    /// resampling (Phase 5). The values are logged for observability.
     pub async fn create_session(
         &self,
         velo: &Arc<Velo>,
@@ -234,10 +220,7 @@ impl<B: AsrBackend + 'static> SessionManager<B> {
             .await
             .map_err(|e| anyhow::anyhow!("failed to attach event sender: {e}"))?;
 
-        let pipeline = AsrPipeline::new(
-            (self.backend_factory)(),
-            self.pipeline_config.clone(),
-        );
+        let pipeline = (self.pipeline_factory)();
 
         let vad = match &self.vad_factory {
             Some(factory) => Some(factory()?),
@@ -285,11 +268,6 @@ impl<B: AsrBackend + 'static> SessionManager<B> {
     }
 
     /// Destroy an active session. Cancels the pipeline and waits for cleanup.
-    ///
-    /// Idempotent: returns success if the session already completed naturally
-    /// (the session loop self-removes on exit). If in-flight inference blocks
-    /// the task beyond `DESTROY_TIMEOUT`, the task is detached and will
-    /// self-remove when it eventually completes.
     pub async fn destroy_session(&self, session_id: Uuid) -> Result<DestroySessionResponse> {
         if let Some((_, handle)) = self.sessions.remove(&session_id) {
             handle.cancel.cancel();
@@ -319,9 +297,9 @@ impl<B: AsrBackend + 'static> SessionManager<B> {
 }
 
 /// Register create_session and destroy_session handlers on a Velo instance.
-pub fn register_handlers<B: AsrBackend + 'static>(
+pub fn register_handlers(
     velo: &Arc<Velo>,
-    manager: &Arc<SessionManager<B>>,
+    manager: &Arc<SessionManager>,
 ) -> Result<()> {
     // create_session handler
     let v = Arc::clone(velo);
@@ -355,16 +333,12 @@ pub fn register_handlers<B: AsrBackend + 'static>(
 }
 
 /// Per-session async loop: reads audio, runs pipeline via spawn_compute, sends events.
-///
-/// On exit (any path), the session removes itself from the session map and
-/// finalizes the event stream. This ensures natural completion (audio finalized,
-/// sender dropped) cleans up without requiring an explicit `destroy_session` call.
-async fn session_loop<B: AsrBackend + 'static>(
+async fn session_loop(
     session_id: Uuid,
     sessions: Arc<DashMap<Uuid, SessionHandle>>,
     mut audio_anchor: StreamAnchor<AudioChunk>,
     event_sender: StreamSender<AsrEvent>,
-    mut state: PipelineState<B>,
+    mut state: PipelineState,
     cancel: CancellationToken,
 ) {
     tracing::info!(%session_id, "session loop started");
@@ -374,7 +348,6 @@ async fn session_loop<B: AsrBackend + 'static>(
     'session: loop {
         let frame = tokio::select! {
             _ = cancel.cancelled() => {
-                // Explicit destroy — abort without flushing pending text.
                 tracing::info!(%session_id, "session cancelled");
                 should_flush = false;
                 break 'session;
@@ -400,8 +373,6 @@ async fn session_loop<B: AsrBackend + 'static>(
                 };
                 tracing::trace!(%session_id, samples = samples.len(), rms = format!("{rms:.6}"), "audio chunk received");
 
-                // Offload sync pipeline work to rayon via loom-rs.
-                // State moves in, computes, moves back out.
                 let (s, result) = loom_rs::spawn_compute(move || {
                     let events = state.process_audio(&samples);
                     (state, events)
@@ -438,8 +409,6 @@ async fn session_loop<B: AsrBackend + 'static>(
         }
     }
 
-    // Flush only on natural close (audio finalized, sender dropped, channel closed).
-    // Explicit destroy (cancel) skips flush — destroy means abort.
     if should_flush {
         let (_state, flush_result) = loom_rs::spawn_compute(move || {
             let events = state.flush();
@@ -460,7 +429,6 @@ async fn session_loop<B: AsrBackend + 'static>(
         tracing::warn!(%session_id, %e, "event sender finalize failed");
     }
 
-    // Self-remove from session map. May be None if destroy_session already removed us.
     sessions.remove(&session_id);
 
     tracing::info!(%session_id, "session loop ended");
@@ -470,25 +438,22 @@ async fn session_loop<B: AsrBackend + 'static>(
 fn write_wav_f32(path: &str, samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
     use std::io::Write;
     let num_samples = samples.len() as u32;
-    let byte_rate = sample_rate * 2; // 16-bit mono
+    let byte_rate = sample_rate * 2;
     let data_size = num_samples * 2;
     let file_size = 36 + data_size;
 
     let mut f = std::fs::File::create(path)?;
-    // RIFF header
     f.write_all(b"RIFF")?;
     f.write_all(&file_size.to_le_bytes())?;
     f.write_all(b"WAVE")?;
-    // fmt chunk
     f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?; // chunk size
-    f.write_all(&1u16.to_le_bytes())?; // PCM
-    f.write_all(&1u16.to_le_bytes())?; // mono
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
     f.write_all(&sample_rate.to_le_bytes())?;
     f.write_all(&byte_rate.to_le_bytes())?;
-    f.write_all(&2u16.to_le_bytes())?; // block align
-    f.write_all(&16u16.to_le_bytes())?; // bits per sample
-    // data chunk
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
     f.write_all(b"data")?;
     f.write_all(&data_size.to_le_bytes())?;
     for &s in samples {

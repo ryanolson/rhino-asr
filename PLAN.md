@@ -2,7 +2,7 @@
 
 ## Context
 
-Build a streaming ASR (Automatic Speech Recognition) system in Rust that runs whisper.cpp via whisper-rs, uses Silero VAD for speech detection, and implements LocalAgreement-2 for real-time word confirmation. The system integrates with the velo distributed infrastructure: **velo-streaming** for bidirectional data transport (audio PCM in, ASR events out), **velo-messenger** for session control (create/destroy/configure).
+Build an ASR (Automatic Speech Recognition) system in Rust with selectable chunking strategies. Currently supports whisper.cpp via whisper-rs with Silero VAD for speech detection. Two pipeline modes are available: **utterance mode** (buffer audio, transcribe once on VAD silence, with interval chunking for long utterances) and **streaming mode** (LocalAgreement-2 for progressive word confirmation with self-correcting Commit/Retract/Interim events). The system integrates with the velo distributed infrastructure: **velo-streaming** for bidirectional data transport (audio PCM in, ASR events out), **velo-messenger** for session control (create/destroy/configure). Whisper is a placeholder backend — a true streaming ASR model will eventually replace it.
 
 ## Architecture
 
@@ -12,10 +12,10 @@ Build a streaming ASR (Automatic Speech Recognition) system in Rust that runs wh
 dynamo-whisper/
   crates/
     protocol/       — Wire types: AsrEvent, AudioChunk, control messages, TextBuffer
-    engine/         — Pure LocalAgreement-2 algorithm (no transport deps)
+    engine/         — Pure LocalAgreement-2 algorithm (no transport deps, used by streaming pipeline mode)
     vad/            — Silero VAD wrapper + VadGate hysteresis (ONNX via ort)
     backend/        — AsrBackend trait + WhisperBackend + MockBackend
-    service/        — Pipeline (VAD+engine+backend) + velo session management
+    service/        — AsrPipeline trait + UtterancePipeline + StreamingPipeline + velo session management
     client/         — CLI binary: mic/file capture, streams audio, displays events
 ```
 
@@ -59,6 +59,8 @@ Client ────────────────────────�
 | Engine purity | Zero transport deps | Pure state-machine tests, no mocks needed |
 | Service structure | Library + thin binary | Embeddable in dynamo runtime later |
 | VAD location | Server-side only | Simpler client, server controls thresholds |
+| Pipeline abstraction | Trait + two impls | Utterance (Whisper-optimal) and Streaming (LA-2) are selectable; trait erases backend type from session layer |
+| Whisper as placeholder | Utterance mode default | Whisper is encoder-decoder, fundamentally not streaming; will be replaced by a true streaming model |
 
 ---
 
@@ -128,14 +130,28 @@ Client ────────────────────────�
 
 ---
 
-## Phase 6: End-to-End & Polish — PENDING
+## Phase 6: Real Models + Selectable Pipeline Modes — IN PROGRESS
 
-**Goal:** Real models, latency profiling, error recovery, documentation.
+**What was built (6a — models):**
+- WhisperBackend with whisper-rs, shared `Arc<WhisperContext>` across sessions, per-session `WhisperState`
+- SileroVad with ONNX Runtime (ort), `VadProcessor` trait, integrated into session layer via `VadFactory`
+- Server CLI: `--model-path`, `--vad-model-path`, `--language`, `--beam-size`, `--gpu-device`, `--no-gpu`, `--diagnostic`
+- Diagnostic mode: captures full session audio to WAV, runs one-shot transcription for quality comparison
 
-- End-to-end with Whisper small.en + Silero VAD
-- Latency: audio chunk → committed word event
-- Error recovery: client disconnect, server restart
+**What was built (6b — selectable pipeline modes):**
+- `AsrPipeline` trait (object-safe): `push_audio`, `flush_utterance`, `flush_chunk`, `buffer_full`, `reset`, `transcribe_raw`
+- `UtterancePipeline<B>`: Single-pass VAD-chunked transcription. Optional interval chunking (`chunk_interval_secs`, default 8s) emits `Commit` events every N seconds during long continuous speech, bounding inference latency. `EndOfUtterance` emitted only on VAD SpeechEnd.
+- `StreamingPipeline<B>`: Restored LocalAgreement-2 from Phase 3-5. Periodic transcription at `step_secs` intervals, `AgreementEngine` for progressive word confirmation (Commit/Retract/Interim), buffer trimming after confirmed words, `force_trim` safety valve.
+- `SessionManager` simplified: no longer generic over `B: AsrBackend`, takes `PipelineFactory: Arc<dyn Fn() -> Box<dyn AsrPipeline>>`. Backend type encapsulated in concrete pipeline.
+- Session-layer `buffer_full()` now calls `flush_chunk()` (no EndOfUtterance) instead of `flush_utterance()`. Only VAD SpeechEnd emits EndOfUtterance.
+- Server CLI: `--mode utterance|streaming`, `--chunk-interval`, `--step-interval`
+- 26 pipeline unit tests (13 utterance + 11 streaming + 2 shared helpers). 80 tests total across workspace.
+
+**Remaining:**
+- Per-session config application (language, sample_rate still logged-not-applied)
+- Error recovery coverage (server restart)
 - README with build/run instructions
+- Latency profiling with real models
 
 ---
 

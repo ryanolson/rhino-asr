@@ -2376,6 +2376,7 @@ dependencies = [
  "futures",
  "loom-rs",
  "rhino-backend",
+ "rhino-engine",
  "rhino-protocol",
  "rhino-vad",
  "serde_json",

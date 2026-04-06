@@ -9,7 +9,10 @@ use rhino_backend::mock::MockBackend;
 use rhino_backend::WordToken;
 
 use rhino_protocol::{AsrEvent, SessionConfig};
-use rhino_service::{PipelineConfig, SessionManager, register_handlers};
+use rhino_service::{
+    AsrPipeline, PipelineFactory, SessionManager, UtteranceConfig, UtterancePipeline,
+    register_handlers,
+};
 
 use rhino_client::AsrClient;
 
@@ -32,10 +35,19 @@ fn token(word: &str, start: f32, end: f32) -> WordToken {
     }
 }
 
-fn test_pipeline_config() -> PipelineConfig {
-    PipelineConfig {
-        max_buffer_secs: 30.0,
-    }
+/// Build a pipeline factory from a MockBackend factory.
+fn mock_pipeline_factory(
+    backend_factory: impl Fn() -> MockBackend + Send + Sync + 'static,
+) -> PipelineFactory {
+    Arc::new(move || -> Box<dyn AsrPipeline> {
+        Box::new(UtterancePipeline::new(
+            backend_factory(),
+            UtteranceConfig {
+                max_buffer_secs: 30.0,
+                chunk_interval_secs: None,
+            },
+        ))
+    })
 }
 
 async fn make_pair() -> (Arc<Velo>, Arc<Velo>) {
@@ -96,7 +108,7 @@ fn client_library_session_lifecycle() {
         let (server, client_velo) = make_pair().await;
 
         let manager = Arc::new(SessionManager::new(
-            Arc::new(|| {
+            mock_pipeline_factory(|| {
                 let mut mock = MockBackend::new();
                 mock.set_default_response(vec![
                     token("hello", 0.0, 0.5),
@@ -104,7 +116,6 @@ fn client_library_session_lifecycle() {
                 ]);
                 mock
             }),
-            test_pipeline_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -138,7 +149,6 @@ fn client_library_session_lifecycle() {
         });
         timeout.await.expect("timed out waiting for events");
 
-        // Single-pass pipeline: Commit + EndOfUtterance on flush.
         assert!(
             !all_events.is_empty(),
             "should produce events"
@@ -173,7 +183,7 @@ fn client_library_with_resampling() {
         let (server, client_velo) = make_pair().await;
 
         let manager = Arc::new(SessionManager::new(
-            Arc::new(|| {
+            mock_pipeline_factory(|| {
                 let mut mock = MockBackend::new();
                 mock.set_default_response(vec![
                     token("resampled", 0.0, 0.5),
@@ -181,7 +191,6 @@ fn client_library_with_resampling() {
                 ]);
                 mock
             }),
-            test_pipeline_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -240,8 +249,7 @@ fn client_library_destroy_session() {
         let (server, client_velo) = make_pair().await;
 
         let manager = Arc::new(SessionManager::new(
-            Arc::new(MockBackend::new),
-            test_pipeline_config(),
+            mock_pipeline_factory(MockBackend::new),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -253,14 +261,11 @@ fn client_library_destroy_session() {
         let mut events = session.take_event_stream().unwrap();
         assert_eq!(manager.session_count(), 1);
 
-        // Drop audio sender (simulates client disconnect from audio side).
         drop(session.audio);
 
-        // Explicit destroy — should abort without flush.
         client.destroy_session(session_id).await.unwrap();
         assert_eq!(manager.session_count(), 0);
 
-        // Collect events — destroy means no EndOfUtterance.
         let mut all_events = Vec::new();
         let timeout = tokio::time::timeout(Duration::from_secs(2), async {
             while let Some(event) = events.next().await {
@@ -275,8 +280,6 @@ fn client_library_destroy_session() {
     });
 }
 
-/// Test the external event stream handle path: the caller creates the anchor
-/// elsewhere, passes the handle via the builder, and receives events directly.
 #[test]
 fn external_event_stream_handle() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -293,7 +296,7 @@ fn external_event_stream_handle() {
         let (server, client_velo) = make_pair().await;
 
         let manager = Arc::new(SessionManager::new(
-            Arc::new(|| {
+            mock_pipeline_factory(|| {
                 let mut mock = MockBackend::new();
                 mock.set_default_response(vec![
                     token("external", 0.0, 0.5),
@@ -301,17 +304,14 @@ fn external_event_stream_handle() {
                 ]);
                 mock
             }),
-            test_pipeline_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
         let client = AsrClient::from_velo(client_velo.clone(), server.instance_id());
 
-        // Create the event anchor externally (e.g. on the same or different Velo instance).
         let mut external_anchor = client_velo.create_anchor::<AsrEvent>();
         let external_handle = external_anchor.handle();
 
-        // Use the builder with an external event stream handle.
         let mut session = client
             .session_builder(SessionConfig {
                 language: Some("en".to_string()),
@@ -322,7 +322,6 @@ fn external_event_stream_handle() {
             .await
             .unwrap();
 
-        // take_event_stream should return None — we provided an external handle.
         assert!(
             session.take_event_stream().is_none(),
             "should be None when external handle is provided"
@@ -337,7 +336,6 @@ fn external_event_stream_handle() {
 
         audio.finalize().await.unwrap();
 
-        // Events should arrive on the external anchor, not through the client.
         let events = collect_events_from_anchor(&mut external_anchor).await;
 
         assert!(

@@ -12,7 +12,10 @@ use rhino_protocol::{
     AsrEvent, AudioChunk, CreateSessionRequest, CreateSessionResponse, DestroySessionRequest,
     DestroySessionResponse, SessionConfig,
 };
-use rhino_service::{PipelineConfig, SessionManager, register_handlers};
+use rhino_service::{
+    AsrPipeline, PipelineFactory, SessionManager, UtteranceConfig, UtterancePipeline,
+    register_handlers,
+};
 
 fn new_transport() -> Arc<TcpTransport> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -33,10 +36,19 @@ fn token(word: &str, start: f32, end: f32) -> WordToken {
     }
 }
 
-fn test_pipeline_config() -> PipelineConfig {
-    PipelineConfig {
-        max_buffer_secs: 30.0,
-    }
+/// Build a pipeline factory from a MockBackend factory.
+fn mock_pipeline_factory(
+    backend_factory: impl Fn() -> MockBackend + Send + Sync + 'static,
+) -> PipelineFactory {
+    Arc::new(move || -> Box<dyn AsrPipeline> {
+        Box::new(UtterancePipeline::new(
+            backend_factory(),
+            UtteranceConfig {
+                max_buffer_secs: 30.0,
+                chunk_interval_secs: None,
+            },
+        ))
+    })
 }
 
 /// Build a server and client Velo pair connected over TCP loopback.
@@ -83,10 +95,10 @@ async fn collect_events(anchor: &mut StreamAnchor<AsrEvent>) -> Vec<AsrEvent> {
 }
 
 /// Helper: create session and return (session_id, audio_sender, event_anchor).
-async fn create_test_session<B: AsrBackend + 'static>(
+async fn create_test_session(
     server: &Arc<Velo>,
     client: &Arc<Velo>,
-    _manager: &Arc<SessionManager<B>>,
+    _manager: &Arc<SessionManager>,
 ) -> (Uuid, StreamSender<AudioChunk>, StreamAnchor<AsrEvent>) {
     let event_anchor = client.create_anchor::<AsrEvent>();
     let event_handle = event_anchor.handle();
@@ -135,7 +147,7 @@ fn session_lifecycle() {
         let (server, client) = make_pair().await;
 
         let manager = Arc::new(SessionManager::new(
-            Arc::new(|| {
+            mock_pipeline_factory(|| {
                 let mut mock = MockBackend::new();
                 mock.set_default_response(vec![
                     token("hello", 0.0, 0.5),
@@ -143,7 +155,6 @@ fn session_lifecycle() {
                 ]);
                 mock
             }),
-            test_pipeline_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -205,8 +216,7 @@ fn destroy_session_without_audio() {
         let (server, client) = make_pair().await;
 
         let manager = Arc::new(SessionManager::new(
-            Arc::new(MockBackend::new),
-            test_pipeline_config(),
+            mock_pipeline_factory(MockBackend::new),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -254,7 +264,7 @@ fn destroy_during_active_audio() {
         let (server, client) = make_pair().await;
 
         let manager = Arc::new(SessionManager::new(
-            Arc::new(|| {
+            mock_pipeline_factory(|| {
                 let mut mock = MockBackend::new();
                 mock.set_default_response(vec![
                     token("hello", 0.0, 0.5),
@@ -262,7 +272,6 @@ fn destroy_during_active_audio() {
                 ]);
                 mock
             }),
-            test_pipeline_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -331,13 +340,17 @@ fn destroy_times_out_with_slow_backend() {
         let (server, client) = make_pair().await;
 
         // Backend blocks for 8s per transcribe — longer than DESTROY_TIMEOUT (5s).
+        let delay = Duration::from_secs(8);
         let manager = Arc::new(SessionManager::new(
-            Arc::new(|| SlowBackend {
-                delay: Duration::from_secs(8),
+            Arc::new(move || -> Box<dyn AsrPipeline> {
+                Box::new(UtterancePipeline::new(
+                    SlowBackend { delay },
+                    UtteranceConfig {
+                        max_buffer_secs: 30.0,
+                        chunk_interval_secs: None,
+                    },
+                ))
             }),
-            PipelineConfig {
-                max_buffer_secs: 30.0,
-            },
         ));
         register_handlers(&server, &manager).unwrap();
 

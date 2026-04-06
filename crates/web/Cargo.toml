@@ -28,7 +28,6 @@ futures.workspace = true
 
 [dev-dependencies]
 rhino-backend.workspace = true
-rhino-engine.workspace = true
 rhino-service.workspace = true
 loom-rs.workspace = true
 velo.workspace = true

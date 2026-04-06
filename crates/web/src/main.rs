@@ -19,6 +19,10 @@ struct Args {
     /// Path to static files directory
     #[arg(long, default_value = "crates/web/static")]
     static_dir: PathBuf,
+
+    /// Model description shown in the web UI (e.g. "large-v3-turbo [silero-vad] en")
+    #[arg(long, default_value = "whisper")]
+    model_info: String,
 }
 
 #[tokio::main]
@@ -30,7 +34,10 @@ async fn main() -> Result<()> {
     let client = AsrClient::connect(&args.connect_file).await?;
     info!("connected to ASR server");
 
-    let state = AppState { client };
+    let state = AppState {
+        client,
+        model_info: args.model_info,
+    };
     let app = build_router(state, &args.static_dir);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

@@ -1,5 +1,8 @@
 pub mod mock;
 
+#[cfg(feature = "whisper")]
+pub mod whisper;
+
 /// Trait for typed audio input. Wraps raw `&[f32]` so the backend API
 /// is self-documenting and extensible to other audio representations.
 pub trait AudioData {
@@ -81,6 +84,17 @@ pub struct WordToken {
 pub trait AsrBackend: Send {
     /// Transcribe audio. Returns word tokens with timestamps relative to buffer start.
     fn transcribe(&mut self, audio: &impl AudioData) -> anyhow::Result<Vec<WordToken>>;
+
+    /// Transcribe audio with previous text as context (initial_prompt).
+    /// Improves accuracy at chunk boundaries by giving whisper sentence
+    /// continuity cues. Default: ignores prompt, calls `transcribe()`.
+    fn transcribe_with_prompt(
+        &mut self,
+        audio: &impl AudioData,
+        _prompt: &str,
+    ) -> anyhow::Result<Vec<WordToken>> {
+        self.transcribe(audio)
+    }
 
     /// Reset internal state (new utterance / new session).
     fn reset(&mut self);

@@ -77,6 +77,7 @@ async fn handle_socket_inner(socket: WebSocket, client: AsrClient) -> Result<()>
             match msg {
                 Ok(Message::Binary(bytes)) => {
                     let samples = bytes_to_f32(&bytes);
+                    tracing::debug!(bytes = bytes.len(), samples = samples.len(), "ws binary frame");
                     if let Err(e) = audio.send(&samples).await {
                         warn!("audio send error: {e:#}");
                         break;

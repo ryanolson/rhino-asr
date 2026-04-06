@@ -53,3 +53,6 @@ dashmap = "6"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }
+whisper-rs = "0.16"
+ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
+ndarray = "0.17"

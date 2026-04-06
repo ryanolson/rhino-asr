@@ -4,10 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+whisper = ["rhino-backend/whisper"]
+cuda = ["rhino-backend/cuda"]
+silero = ["rhino-vad/silero"]
+
 [dependencies]
 rhino-protocol.workspace = true
-rhino-engine.workspace = true
 rhino-backend.workspace = true
+rhino-vad.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true

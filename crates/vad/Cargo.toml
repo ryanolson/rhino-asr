@@ -4,5 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+silero = ["dep:ort", "dep:ndarray"]
+
 [dependencies]
 anyhow.workspace = true
+ort = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }

@@ -1,3 +1,12 @@
+// --- Fetch model info from server ---
+fetch('/api/info')
+  .then(r => r.json())
+  .then(info => {
+    const el = document.getElementById('subtitle');
+    if (el && info.model) el.textContent = info.model;
+  })
+  .catch(() => {});
+
 // --- TextBuffer: mirrors crates/protocol/src/text_buffer.rs ---
 
 class TextBuffer {

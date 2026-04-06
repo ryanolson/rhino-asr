@@ -7,7 +7,7 @@ use velo_transports::tcp::TcpTransportBuilder;
 
 use rhino_backend::mock::MockBackend;
 use rhino_backend::WordToken;
-use rhino_engine::AgreementConfig;
+
 use rhino_protocol::{AsrEvent, SessionConfig};
 use rhino_service::{PipelineConfig, SessionManager, register_handlers};
 
@@ -34,16 +34,7 @@ fn token(word: &str, start: f32, end: f32) -> WordToken {
 
 fn test_pipeline_config() -> PipelineConfig {
     PipelineConfig {
-        step_secs: 0.0,
         max_buffer_secs: 30.0,
-        min_chunk_secs: 0.0,
-    }
-}
-
-fn test_engine_config() -> AgreementConfig {
-    AgreementConfig {
-        min_agreement: 2,
-        commit_lookahead_secs: 0.5,
     }
 }
 
@@ -114,7 +105,6 @@ fn client_library_session_lifecycle() {
                 mock
             }),
             test_pipeline_config(),
-            test_engine_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -148,8 +138,7 @@ fn client_library_session_lifecycle() {
         });
         timeout.await.expect("timed out waiting for events");
 
-        // Verify ordering contract (same as service-level test):
-        // Interims before first Commit, no Retract, EndOfUtterance last.
+        // Single-pass pipeline: Commit + EndOfUtterance on flush.
         assert!(
             !all_events.is_empty(),
             "should produce events"
@@ -158,21 +147,9 @@ fn client_library_session_lifecycle() {
             matches!(all_events.last(), Some(AsrEvent::EndOfUtterance)),
             "last event must be EndOfUtterance on natural close: {all_events:?}"
         );
-        let first_commit = all_events
-            .iter()
-            .position(|e| matches!(e, AsrEvent::Commit { .. }));
-        let first_interim = all_events
-            .iter()
-            .position(|e| matches!(e, AsrEvent::Interim { .. }));
-        assert!(first_interim.is_some(), "should have interim: {all_events:?}");
-        assert!(first_commit.is_some(), "should have commit: {all_events:?}");
         assert!(
-            first_interim.unwrap() < first_commit.unwrap(),
-            "interim before commit: {all_events:?}"
-        );
-        assert!(
-            !all_events.iter().any(|e| matches!(e, AsrEvent::Retract { .. })),
-            "no retract with stable words: {all_events:?}"
+            all_events.iter().any(|e| matches!(e, AsrEvent::Commit { .. })),
+            "should have commit: {all_events:?}"
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -205,7 +182,6 @@ fn client_library_with_resampling() {
                 mock
             }),
             test_pipeline_config(),
-            test_engine_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -266,7 +242,6 @@ fn client_library_destroy_session() {
         let manager = Arc::new(SessionManager::new(
             Arc::new(MockBackend::new),
             test_pipeline_config(),
-            test_engine_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 
@@ -327,7 +302,6 @@ fn external_event_stream_handle() {
                 mock
             }),
             test_pipeline_config(),
-            test_engine_config(),
         ));
         register_handlers(&server, &manager).unwrap();
 

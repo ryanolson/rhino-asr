@@ -9,11 +9,11 @@ use uuid::Uuid;
 use velo::{Handler, StreamAnchor, StreamFrame, StreamSender, TypedContext, Velo};
 
 use rhino_backend::AsrBackend;
-use rhino_engine::AgreementConfig;
 use rhino_protocol::{
     AsrEvent, AudioChunk, CreateSessionRequest, CreateSessionResponse, DestroySessionRequest,
     DestroySessionResponse,
 };
+use rhino_vad::{VadConfig, VadGate, VadProcessor, VadTransition};
 
 use crate::pipeline::{AsrPipeline, PipelineConfig};
 
@@ -29,26 +29,188 @@ struct SessionHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Bundles all sync state that moves in/out of `spawn_compute`.
+struct PipelineState<B: AsrBackend> {
+    pipeline: AsrPipeline<B>,
+    vad: Option<Box<dyn VadProcessor>>,
+    gate: VadGate,
+    vad_buffer: Vec<f32>,
+    /// Captures ALL audio (pre-VAD) for diagnostic one-shot evaluation.
+    capture_buffer: Vec<f32>,
+    /// Enable diagnostic one-shot comparison on flush.
+    diagnostic: bool,
+}
+
+impl<B: AsrBackend> PipelineState<B> {
+    /// Process an audio chunk through VAD gate + pipeline.
+    ///
+    /// When VAD is present, audio is chunked into VAD-sized pieces and gated
+    /// through the hysteresis state machine. Only speech audio reaches the
+    /// pipeline buffer. Transcription happens on flush (SpeechEnd) or when
+    /// the buffer exceeds max duration (long utterance split).
+    ///
+    /// When VAD is None, all audio buffers directly in the pipeline.
+    fn process_audio(&mut self, samples: &[f32]) -> Result<Vec<AsrEvent>> {
+        if self.diagnostic {
+            self.capture_buffer.extend_from_slice(samples);
+        }
+
+        let Some(ref mut vad) = self.vad else {
+            // No VAD — buffer everything directly.
+            self.pipeline.push_audio(samples);
+            return Ok(vec![]);
+        };
+
+        let chunk_size = vad.chunk_size();
+        let mut events = Vec::new();
+
+        // Append to VAD buffer for chunking.
+        self.vad_buffer.extend_from_slice(samples);
+
+        // Process complete VAD-sized chunks.
+        while self.vad_buffer.len() >= chunk_size {
+            let chunk: Vec<f32> = self.vad_buffer.drain(..chunk_size).collect();
+
+            let prob = vad.process_chunk(&chunk)?;
+            tracing::trace!(prob = format!("{prob:.3}"), is_speech = self.gate.is_speech(), "VAD chunk");
+
+            if let Some(transition) = self.gate.update(prob) {
+                match transition {
+                    VadTransition::SpeechStart => {
+                        tracing::info!("VAD: speech start");
+                    }
+                    VadTransition::SpeechEnd => {
+                        tracing::info!("VAD: speech end, flushing utterance");
+                        events.extend(self.pipeline.flush_utterance()?);
+                    }
+                }
+            }
+
+            if self.gate.is_speech() {
+                self.pipeline.push_audio(&chunk);
+
+                // Long utterance split: if buffer exceeds max, flush now.
+                // This handles continuous speech without pauses (monologues).
+                if self.pipeline.buffer_full() {
+                    tracing::info!(
+                        buf_secs = format!("{:.1}", self.pipeline.buffer_duration_secs()),
+                        "long utterance split"
+                    );
+                    events.extend(self.pipeline.flush_utterance()?);
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Flush any remaining audio and finalize the current utterance.
+    fn flush(&mut self) -> Result<Vec<AsrEvent>> {
+        // Process any leftover audio in the VAD buffer.
+        if self.vad.is_some() && !self.vad_buffer.is_empty() {
+            // Pad remaining samples to chunk size and process.
+            let chunk_size = self.vad.as_ref().unwrap().chunk_size();
+            let remaining = std::mem::take(&mut self.vad_buffer);
+            if remaining.len() < chunk_size {
+                let mut padded = remaining;
+                padded.resize(chunk_size, 0.0);
+                // Process but ignore VAD result — we're flushing.
+                let _ = self.vad.as_mut().unwrap().process_chunk(&padded);
+            }
+        }
+
+        let events = self.pipeline.flush_utterance()?;
+
+        if self.diagnostic {
+            self.diagnostic_oneshot();
+        }
+
+        Ok(events)
+    }
+
+    /// Write all captured audio to a WAV file and run a single-shot
+    /// transcription for quality comparison against streaming output.
+    fn diagnostic_oneshot(&mut self) {
+        let samples = std::mem::take(&mut self.capture_buffer);
+        if samples.is_empty() {
+            return;
+        }
+
+        let duration_secs = samples.len() as f32 / 16_000.0;
+        tracing::info!(
+            samples = samples.len(),
+            duration_secs = format!("{duration_secs:.2}"),
+            "diagnostic: captured audio"
+        );
+
+        // Write WAV file.
+        let wav_path = format!("/tmp/rhino-capture-{}.wav", std::process::id());
+        match write_wav_f32(&wav_path, &samples, 16_000) {
+            Ok(()) => tracing::info!(path = %wav_path, "diagnostic: wrote capture WAV"),
+            Err(e) => {
+                tracing::warn!("diagnostic: failed to write WAV: {e}");
+                return;
+            }
+        }
+
+        // One-shot transcription of the full buffer.
+        match self.pipeline.transcribe_raw(&samples) {
+            Ok(tokens) => {
+                let text: String = tokens.iter().map(|t| t.word.as_str()).collect::<Vec<_>>().join(" ");
+                tracing::info!(
+                    words = tokens.len(),
+                    text = %text,
+                    "diagnostic: ONE-SHOT transcription"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("diagnostic: one-shot transcription failed: {e}");
+            }
+        }
+    }
+}
+
+/// Factory type for creating VAD processors per session.
+pub type VadFactory = Arc<dyn Fn() -> Result<Box<dyn VadProcessor>> + Send + Sync>;
+
 /// Manages the lifecycle of all active ASR sessions.
 pub struct SessionManager<B: AsrBackend> {
     sessions: Arc<DashMap<Uuid, SessionHandle>>,
     backend_factory: Arc<dyn Fn() -> B + Send + Sync>,
     pipeline_config: PipelineConfig,
-    engine_config: AgreementConfig,
+    vad_factory: Option<VadFactory>,
+    vad_config: VadConfig,
+    diagnostic: bool,
 }
 
 impl<B: AsrBackend + 'static> SessionManager<B> {
     pub fn new(
         backend_factory: Arc<dyn Fn() -> B + Send + Sync>,
         pipeline_config: PipelineConfig,
-        engine_config: AgreementConfig,
     ) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
             backend_factory,
             pipeline_config,
-            engine_config,
+            vad_factory: None,
+            vad_config: VadConfig::default(),
+            diagnostic: false,
         }
+    }
+
+    /// Set a VAD factory. When set, each session creates a VAD processor
+    /// that gates audio before it reaches the pipeline.
+    pub fn with_vad(mut self, factory: VadFactory, config: VadConfig) -> Self {
+        self.vad_factory = Some(factory);
+        self.vad_config = config;
+        self
+    }
+
+    /// Enable diagnostic one-shot comparison (captures all audio, runs
+    /// full-buffer transcription on flush for quality comparison).
+    pub fn with_diagnostic(mut self, enabled: bool) -> Self {
+        self.diagnostic = enabled;
+        self
     }
 
     /// Create a new ASR session.
@@ -74,9 +236,22 @@ impl<B: AsrBackend + 'static> SessionManager<B> {
 
         let pipeline = AsrPipeline::new(
             (self.backend_factory)(),
-            self.engine_config.clone(),
             self.pipeline_config.clone(),
         );
+
+        let vad = match &self.vad_factory {
+            Some(factory) => Some(factory()?),
+            None => None,
+        };
+
+        let state = PipelineState {
+            pipeline,
+            vad,
+            gate: VadGate::new(self.vad_config.clone()),
+            vad_buffer: Vec::new(),
+            capture_buffer: Vec::new(),
+            diagnostic: self.diagnostic,
+        };
 
         let cancel = CancellationToken::new();
         let session_id = Uuid::new_v4();
@@ -85,6 +260,7 @@ impl<B: AsrBackend + 'static> SessionManager<B> {
             %session_id,
             language = ?request.config.language,
             sample_rate = request.config.sample_rate,
+            vad_enabled = self.vad_factory.is_some(),
             "session created (config accepted but not yet applied)",
         );
 
@@ -93,7 +269,7 @@ impl<B: AsrBackend + 'static> SessionManager<B> {
             Arc::clone(&self.sessions),
             audio_anchor,
             event_sender,
-            pipeline,
+            state,
             cancel.clone(),
         ));
 
@@ -188,7 +364,7 @@ async fn session_loop<B: AsrBackend + 'static>(
     sessions: Arc<DashMap<Uuid, SessionHandle>>,
     mut audio_anchor: StreamAnchor<AudioChunk>,
     event_sender: StreamSender<AsrEvent>,
-    mut pipeline: AsrPipeline<B>,
+    mut state: PipelineState<B>,
     cancel: CancellationToken,
 ) {
     tracing::info!(%session_id, "session loop started");
@@ -217,15 +393,21 @@ async fn session_loop<B: AsrBackend + 'static>(
         match frame {
             Ok(StreamFrame::Item(chunk)) => {
                 let samples = chunk.samples;
+                let rms = if samples.is_empty() {
+                    0.0
+                } else {
+                    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+                };
+                tracing::trace!(%session_id, samples = samples.len(), rms = format!("{rms:.6}"), "audio chunk received");
 
                 // Offload sync pipeline work to rayon via loom-rs.
-                // Pipeline moves in, computes, moves back out.
-                let (p, result) = loom_rs::spawn_compute(move || {
-                    let events = pipeline.push_audio(&samples);
-                    (pipeline, events)
+                // State moves in, computes, moves back out.
+                let (s, result) = loom_rs::spawn_compute(move || {
+                    let events = state.process_audio(&samples);
+                    (state, events)
                 })
                 .await;
-                pipeline = p;
+                state = s;
 
                 match result {
                     Ok(events) => {
@@ -259,9 +441,9 @@ async fn session_loop<B: AsrBackend + 'static>(
     // Flush only on natural close (audio finalized, sender dropped, channel closed).
     // Explicit destroy (cancel) skips flush — destroy means abort.
     if should_flush {
-        let (_pipeline, flush_result) = loom_rs::spawn_compute(move || {
-            let events = pipeline.flush_utterance();
-            (pipeline, events)
+        let (_state, flush_result) = loom_rs::spawn_compute(move || {
+            let events = state.flush();
+            (state, events)
         })
         .await;
 
@@ -282,4 +464,37 @@ async fn session_loop<B: AsrBackend + 'static>(
     sessions.remove(&session_id);
 
     tracing::info!(%session_id, "session loop ended");
+}
+
+/// Write f32 PCM samples as a 16-bit WAV file.
+fn write_wav_f32(path: &str, samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
+    use std::io::Write;
+    let num_samples = samples.len() as u32;
+    let byte_rate = sample_rate * 2; // 16-bit mono
+    let data_size = num_samples * 2;
+    let file_size = 36 + data_size;
+
+    let mut f = std::fs::File::create(path)?;
+    // RIFF header
+    f.write_all(b"RIFF")?;
+    f.write_all(&file_size.to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    // fmt chunk
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; // chunk size
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&1u16.to_le_bytes())?; // mono
+    f.write_all(&sample_rate.to_le_bytes())?;
+    f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?; // block align
+    f.write_all(&16u16.to_le_bytes())?; // bits per sample
+    // data chunk
+    f.write_all(b"data")?;
+    f.write_all(&data_size.to_le_bytes())?;
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let i16_val = (clamped * 32767.0) as i16;
+        f.write_all(&i16_val.to_le_bytes())?;
+    }
+    Ok(())
 }

@@ -56,6 +56,14 @@ impl AudioSender {
     /// Push audio samples at the session's configured sample rate.
     /// Internally resamples to 16kHz, buffers, and sends complete chunks.
     pub async fn send(&mut self, samples: &[f32]) -> Result<()> {
+        tracing::trace!(
+            input_samples = samples.len(),
+            buffer = self.buffer.len(),
+            pending = self.resample_pending.len(),
+            seq = self.sequence,
+            has_resampler = self.resampler.is_some(),
+            "audio_sender.send"
+        );
         match &mut self.resampler {
             Some(resampler) => {
                 self.resample_pending.extend_from_slice(samples);
@@ -121,6 +129,7 @@ impl AudioSender {
                 sequence: self.sequence,
             };
             self.sequence += 1;
+            tracing::debug!(seq = self.sequence, buffer_remaining = self.buffer.len(), "sending audio chunk to server");
             self.inner
                 .send(chunk)
                 .await

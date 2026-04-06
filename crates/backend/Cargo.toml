@@ -4,5 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+whisper = ["dep:whisper-rs"]
+cuda = ["whisper-rs?/cuda"]
+
 [dependencies]
 anyhow.workspace = true
+whisper-rs = { workspace = true, optional = true }

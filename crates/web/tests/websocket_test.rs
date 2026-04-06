@@ -9,7 +9,7 @@ use velo_transports::tcp::TcpTransportBuilder;
 
 use rhino_backend::mock::MockBackend;
 use rhino_backend::WordToken;
-use rhino_engine::AgreementConfig;
+
 use rhino_protocol::AsrEvent;
 use rhino_service::{PipelineConfig, SessionManager, register_handlers};
 
@@ -37,16 +37,7 @@ fn token(word: &str, start: f32, end: f32) -> WordToken {
 
 fn test_pipeline_config() -> PipelineConfig {
     PipelineConfig {
-        step_secs: 0.0,
         max_buffer_secs: 30.0,
-        min_chunk_secs: 0.0,
-    }
-}
-
-fn test_engine_config() -> AgreementConfig {
-    AgreementConfig {
-        min_agreement: 2,
-        commit_lookahead_secs: 0.5,
     }
 }
 
@@ -84,12 +75,11 @@ async fn start_web_server(
     let manager = Arc::new(SessionManager::new(
         backend_factory,
         test_pipeline_config(),
-        test_engine_config(),
     ));
     register_handlers(&server_velo, &manager).unwrap();
 
     let client = AsrClient::from_velo(client_velo, server_velo.instance_id());
-    let state = AppState { client };
+    let state = AppState { client, model_info: "test".into() };
 
     // Use a temp dir for static files (we don't need them for WS tests)
     let static_dir = std::env::temp_dir();
@@ -191,12 +181,6 @@ fn websocket_session_lifecycle() {
         assert!(
             events.iter().any(|e| matches!(e, AsrEvent::Commit { .. })),
             "should have commit: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AsrEvent::Interim { .. })),
-            "should have interim: {events:?}"
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -344,12 +328,11 @@ async fn start_http_server_with_static() -> String {
     let manager = Arc::new(SessionManager::new(
         Arc::new(MockBackend::new),
         test_pipeline_config(),
-        test_engine_config(),
     ));
     register_handlers(&server_velo, &manager).unwrap();
 
     let client = AsrClient::from_velo(client_velo, server_velo.instance_id());
-    let state = AppState { client };
+    let state = AppState { client, model_info: "test".into() };
 
     // Use the real static directory
     let static_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");

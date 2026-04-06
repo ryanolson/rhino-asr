@@ -41,6 +41,10 @@ pub struct AsrPipeline<B: AsrBackend> {
     trim_offset: usize,
     /// Buffer length at last transcription (to enforce step_secs).
     samples_at_last_transcribe: usize,
+    /// Number of committed words already accounted for by buffer trimming.
+    /// After trimming, the token window no longer contains these words, so
+    /// `find_last_committed_end` must skip them.
+    trimmed_committed_count: usize,
 }
 
 impl<B: AsrBackend> AsrPipeline<B> {
@@ -52,6 +56,7 @@ impl<B: AsrBackend> AsrPipeline<B> {
             audio_buf: PcmBuffer::new(),
             trim_offset: 0,
             samples_at_last_transcribe: 0,
+            trimmed_committed_count: 0,
         }
     }
 
@@ -86,23 +91,27 @@ impl<B: AsrBackend> AsrPipeline<B> {
     /// emits `EndOfUtterance`, and clears state. Returns `Ok` with whatever
     /// events could be salvaged.
     pub fn flush_utterance(&mut self) -> anyhow::Result<Vec<AsrEvent>> {
-        if self.audio_buf.is_empty() {
+        // Determine if an utterance was active: either audio remains in the buffer,
+        // or audio was previously consumed and trimmed (trim_offset > 0).
+        let had_utterance = !self.audio_buf.is_empty() || self.trim_offset > 0;
+        if !had_utterance {
             return Ok(vec![]);
         }
 
-        // Final transcription of remaining audio.
-        let step_events = match self.step() {
-            Ok(evs) => evs,
-            Err(e) => {
-                tracing::warn!("final transcription failed during flush: {e:#}");
-                vec![]
+        let mut events = Vec::new();
+
+        // Final transcription of remaining audio (skip if buffer was fully trimmed).
+        if !self.audio_buf.is_empty() {
+            match self.step() {
+                Ok(evs) => events.extend(evs),
+                Err(e) => {
+                    tracing::warn!("final transcription failed during flush: {e:#}");
+                }
             }
-        };
+        }
 
         // Flush engine — commits everything regardless of agreement.
         let flush_events = self.engine.flush();
-
-        let mut events = step_events;
         events.extend(flush_events.into_iter().map(engine_to_asr));
         events.push(AsrEvent::EndOfUtterance);
 
@@ -110,6 +119,7 @@ impl<B: AsrBackend> AsrPipeline<B> {
         self.audio_buf.0.clear();
         self.trim_offset = 0;
         self.samples_at_last_transcribe = 0;
+        self.trimmed_committed_count = 0;
         self.engine.reset();
 
         Ok(events)
@@ -120,6 +130,7 @@ impl<B: AsrBackend> AsrPipeline<B> {
         self.audio_buf.0.clear();
         self.trim_offset = 0;
         self.samples_at_last_transcribe = 0;
+        self.trimmed_committed_count = 0;
         self.engine.reset();
         self.backend.reset();
     }
@@ -142,22 +153,32 @@ impl<B: AsrBackend> AsrPipeline<B> {
     }
 
     /// Trim oldest audio up to the last confirmed word's end timestamp.
+    ///
+    /// Only matches committed words added since the last trim — earlier
+    /// committed words are no longer in the token window after trimming.
+    /// Clears engine hypothesis state after trimming because buffer-relative
+    /// timestamps shift, invalidating the agreement counters.
     fn trim_to_confirmed(&mut self, tokens: &[WordToken]) {
         let committed = self.engine.committed_text();
-        if committed.is_empty() {
+        let new_committed = &committed[self.trimmed_committed_count..];
+        if new_committed.is_empty() {
             return;
         }
 
-        // Find the end timestamp of the last committed word in the token list.
-        if let Some(last_end) = find_last_committed_end(committed, tokens) {
+        // Find the end timestamp of the last newly-committed word in the token list.
+        if let Some(last_end) = find_last_committed_end(new_committed, tokens) {
             let trim_samples = (last_end * SAMPLE_RATE as f32) as usize;
             let trim_samples = trim_samples.min(self.audio_buf.len());
             if trim_samples > 0 {
                 self.trim_offset += trim_samples;
                 self.audio_buf.0.drain(..trim_samples);
-                // Adjust samples_at_last_transcribe relative to new buffer start.
                 self.samples_at_last_transcribe =
                     self.samples_at_last_transcribe.saturating_sub(trim_samples);
+                self.trimmed_committed_count = committed.len();
+                // Timestamps shifted — agreement state is invalid.
+                // Freeze committed words so they're not retracted by post-trim confirmations.
+                self.engine.freeze_committed();
+                self.engine.clear_hypothesis();
             }
         }
     }
@@ -179,6 +200,8 @@ impl<B: AsrBackend> AsrPipeline<B> {
         self.trim_offset += trim;
         self.audio_buf.0.drain(..trim);
         self.samples_at_last_transcribe = self.samples_at_last_transcribe.saturating_sub(trim);
+        self.trimmed_committed_count = self.engine.committed_text().len();
+        self.engine.freeze_committed();
         self.engine.clear_hypothesis();
     }
 }
@@ -553,5 +576,143 @@ mod tests {
             !events3.iter().any(|e| matches!(e, AsrEvent::Retract { .. })),
             "force_trim must not cause retraction on next update"
         );
+    }
+
+    // --- Sliding-window trim correctness ---
+
+    /// Exercises multiple rounds of normal trimming. After the first commit
+    /// and trim, the token window no longer contains already-trimmed words.
+    /// Subsequent commits must still trigger trimming to keep the buffer bounded.
+    #[test]
+    fn multi_round_trimming_stays_bounded() {
+        // Backend returns incrementally longer sequences to simulate real
+        // whisper output over a growing-then-trimmed buffer.
+        let mut mock = MockBackend::new();
+
+        // Rounds 1-2: "hello world" → commit + trim after round 2.
+        mock.queue_response(vec![token("hello", 0.0, 0.5), token("world", 0.5, 1.0)]);
+        mock.queue_response(vec![token("hello", 0.0, 0.5), token("world", 0.5, 1.0)]);
+
+        // After trim, buffer restarts. Rounds 3-4: "foo bar" from the new origin.
+        mock.queue_response(vec![token("foo", 0.0, 0.5), token("bar", 0.5, 1.0)]);
+        mock.queue_response(vec![token("foo", 0.0, 0.5), token("bar", 0.5, 1.0)]);
+
+        // After second trim. Rounds 5-6: "baz" from the new origin.
+        mock.queue_response(vec![token("baz", 0.0, 0.5)]);
+        mock.queue_response(vec![token("baz", 0.0, 0.5)]);
+
+        let mut pipeline = pipeline_with_mock(mock);
+
+        // Round 1: agreement=1, interim only. No trim.
+        push_one_sec(&mut pipeline).unwrap();
+        let buf_after_1 = pipeline.audio_buf.len();
+        assert_eq!(buf_after_1, SAMPLE_RATE); // 1s
+
+        // Round 2: agreement=2, commit "hello world". Trim to 1.0s.
+        let events = push_one_sec(&mut pipeline).unwrap();
+        assert!(events.iter().any(|e| matches!(e, AsrEvent::Commit { .. })));
+        let buf_after_2 = pipeline.audio_buf.len();
+        assert!(
+            buf_after_2 < 2 * SAMPLE_RATE,
+            "buffer should have been trimmed after first commit: {buf_after_2}"
+        );
+        assert_eq!(pipeline.trimmed_committed_count, 2); // "hello", "world"
+
+        // Round 3: fresh agreement after trim, agreement=1 for "foo bar".
+        push_one_sec(&mut pipeline).unwrap();
+
+        // Round 4: agreement=2, commit "foo bar". Second trim.
+        let events = push_one_sec(&mut pipeline).unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, AsrEvent::Commit { .. })),
+            "should commit 'foo bar' in second trim round: {events:?}"
+        );
+        let buf_after_4 = pipeline.audio_buf.len();
+        assert!(
+            buf_after_4 < 3 * SAMPLE_RATE,
+            "buffer should have been trimmed after second commit: {buf_after_4}"
+        );
+        assert_eq!(pipeline.trimmed_committed_count, 4); // +2 for "foo", "bar"
+
+        // Round 5-6: third commit cycle.
+        push_one_sec(&mut pipeline).unwrap();
+        let events = push_one_sec(&mut pipeline).unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, AsrEvent::Commit { .. })),
+            "should commit 'baz' in third trim round: {events:?}"
+        );
+        assert_eq!(pipeline.trimmed_committed_count, 5);
+
+        // Full committed history preserved across all trims.
+        assert_eq!(
+            pipeline.engine.committed_text(),
+            &["hello", "world", "foo", "bar", "baz"]
+        );
+    }
+
+    /// Verifies exact event sequence across a commit-trim-commit cycle.
+    #[test]
+    fn exact_event_sequence_across_trims() {
+        let mut mock = MockBackend::new();
+        mock.queue_response(vec![token("a", 0.0, 0.5)]);
+        mock.queue_response(vec![token("a", 0.0, 0.5)]);
+        // Post-trim: new tokens from buffer origin.
+        mock.queue_response(vec![token("b", 0.0, 0.5)]);
+        mock.queue_response(vec![token("b", 0.0, 0.5)]);
+
+        let mut pipeline = pipeline_with_mock(mock);
+
+        let e1 = push_one_sec(&mut pipeline).unwrap();
+        assert_eq!(
+            e1.iter()
+                .filter(|e| matches!(e, AsrEvent::Interim { .. }))
+                .count(),
+            1,
+            "round 1: exactly one interim"
+        );
+
+        let e2 = push_one_sec(&mut pipeline).unwrap();
+        assert!(
+            e2.iter().any(|e| *e == AsrEvent::Commit { text: "a".into() }),
+            "round 2: commit 'a': {e2:?}"
+        );
+
+        let e3 = push_one_sec(&mut pipeline).unwrap();
+        assert!(
+            e3.iter().any(|e| matches!(e, AsrEvent::Interim { .. })),
+            "round 3: interim for 'b': {e3:?}"
+        );
+        assert!(
+            !e3.iter().any(|e| matches!(e, AsrEvent::Retract { .. })),
+            "round 3: no retract: {e3:?}"
+        );
+
+        let e4 = push_one_sec(&mut pipeline).unwrap();
+        assert!(
+            e4.iter().any(|e| *e == AsrEvent::Commit { text: "b".into() }),
+            "round 4: commit 'b': {e4:?}"
+        );
+        assert!(
+            !e4.iter().any(|e| matches!(e, AsrEvent::Retract { .. })),
+            "round 4: no retract: {e4:?}"
+        );
+    }
+
+    /// After flush, trimmed_committed_count resets so the next utterance starts clean.
+    #[test]
+    fn flush_resets_trimmed_committed_count() {
+        let mut mock = MockBackend::new();
+        mock.set_default_response(vec![token("hello", 0.0, 0.5)]);
+
+        let mut pipeline = pipeline_with_mock(mock);
+
+        // Commit + trim.
+        push_one_sec(&mut pipeline).unwrap();
+        push_one_sec(&mut pipeline).unwrap();
+        assert!(pipeline.trimmed_committed_count > 0);
+
+        pipeline.flush_utterance().unwrap();
+        assert_eq!(pipeline.trimmed_committed_count, 0);
+        assert_eq!(pipeline.trim_offset, 0);
     }
 }

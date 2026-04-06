@@ -193,10 +193,14 @@ async fn session_loop<B: AsrBackend + 'static>(
 ) {
     tracing::info!(%session_id, "session loop started");
 
+    let mut should_flush = true;
+
     'session: loop {
         let frame = tokio::select! {
             _ = cancel.cancelled() => {
+                // Explicit destroy — abort without flushing pending text.
                 tracing::info!(%session_id, "session cancelled");
+                should_flush = false;
                 break 'session;
             }
             frame = audio_anchor.next() => {
@@ -252,17 +256,20 @@ async fn session_loop<B: AsrBackend + 'static>(
         }
     }
 
-    // Flush remaining audio.
-    let (_pipeline, flush_result) = loom_rs::spawn_compute(move || {
-        let events = pipeline.flush_utterance();
-        (pipeline, events)
-    })
-    .await;
+    // Flush only on natural close (audio finalized, sender dropped, channel closed).
+    // Explicit destroy (cancel) skips flush — destroy means abort.
+    if should_flush {
+        let (_pipeline, flush_result) = loom_rs::spawn_compute(move || {
+            let events = pipeline.flush_utterance();
+            (pipeline, events)
+        })
+        .await;
 
-    if let Ok(events) = flush_result {
-        for event in events {
-            if event_sender.send(event).await.is_err() {
-                break;
+        if let Ok(events) = flush_result {
+            for event in events {
+                if event_sender.send(event).await.is_err() {
+                    break;
+                }
             }
         }
     }

@@ -21,6 +21,8 @@ tokio-util.workspace = true
 # Binary-only deps (kept unconditional for simplicity)
 velo-transports.workspace = true
 tracing-subscriber.workspace = true
+clap.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

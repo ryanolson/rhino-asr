@@ -58,6 +58,11 @@ pub struct AgreementEngine {
     prev_hypothesis: Vec<WordHypothesis>,
     agreement: Vec<usize>,
     committed: Vec<String>,
+    /// Number of committed words that are frozen (from before buffer trims).
+    /// Reconciliation only considers `committed[frozen_prefix..]`.
+    /// Frozen words are never retracted — they represent confirmed text whose
+    /// audio has been trimmed away.
+    frozen_prefix: usize,
 }
 
 impl AgreementEngine {
@@ -67,6 +72,7 @@ impl AgreementEngine {
             prev_hypothesis: Vec::new(),
             agreement: Vec::new(),
             committed: Vec::new(),
+            frozen_prefix: 0,
         }
     }
 
@@ -166,10 +172,21 @@ impl AgreementEngine {
         self.agreement.clear();
     }
 
+    /// Freeze all currently committed words. Frozen words are excluded from
+    /// reconciliation — they cannot be retracted by future confirmations.
+    ///
+    /// Call after buffer trimming: the trimmed audio produced these commits,
+    /// and new confirmations from the post-trim buffer should only extend,
+    /// not replace, the frozen prefix.
+    pub fn freeze_committed(&mut self) {
+        self.frozen_prefix = self.committed.len();
+    }
+
     /// Reset all state for a new utterance.
     pub fn reset(&mut self) {
         self.clear_hypothesis();
         self.committed.clear();
+        self.frozen_prefix = 0;
     }
 
     /// Currently committed words.
@@ -177,22 +194,25 @@ impl AgreementEngine {
         &self.committed
     }
 
-    /// Compute Commit/Retract events to bring `self.committed` in line with `target`.
+    /// Compute Commit/Retract events to bring the active (non-frozen) portion
+    /// of `self.committed` in line with `target`.
     ///
     /// When `target` is empty and committed words exist, no retraction occurs.
     /// An empty target means "no confirmed words yet" (insufficient observations),
     /// not "all words are wrong." Retraction is deferred until a non-empty
     /// confirmed prefix provides evidence of what the correct words are.
+    ///
+    /// Frozen words (committed before a buffer trim) are never retracted.
+    /// `target` is reconciled against `committed[frozen_prefix..]` only.
     fn reconcile_commit(&mut self, target: &[&str]) -> Vec<EngineEvent> {
-        // No confirmed words yet — don't retract what we have.
-        // Committed words stay stable until there's a confirmed replacement.
         if target.is_empty() {
             return Vec::new();
         }
 
-        // Find common prefix between committed and target.
-        let common = self
-            .committed
+        let active = &self.committed[self.frozen_prefix..];
+
+        // Find common prefix between active committed and target.
+        let common = active
             .iter()
             .zip(target.iter())
             .take_while(|(a, b)| a.as_str() == **b)
@@ -200,11 +220,11 @@ impl AgreementEngine {
 
         let mut events = Vec::new();
 
-        // Retract divergent words.
-        let retract_n = self.committed.len() - common;
+        // Retract divergent active words (never touches frozen prefix).
+        let retract_n = active.len() - common;
         if retract_n > 0 {
             events.push(EngineEvent::Retract(retract_n));
-            self.committed.truncate(common);
+            self.committed.truncate(self.frozen_prefix + common);
         }
 
         // Commit new words.

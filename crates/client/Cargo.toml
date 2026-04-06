@@ -4,10 +4,35 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "rhino_client"
+path = "src/lib.rs"
+
 [[bin]]
-name = "rhino-client"
-path = "src/main.rs"
+name = "rhino-test-client"
+path = "src/bin/test_client.rs"
 
 [dependencies]
 rhino-protocol.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+velo.workspace = true
+velo-transports.workspace = true
+rubato.workspace = true
+uuid.workspace = true
+
+# Binary deps
+clap.workspace = true
+hound.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rhino-backend.workspace = true
+rhino-engine.workspace = true
+rhino-service.workspace = true
+loom-rs.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

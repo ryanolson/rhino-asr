@@ -102,18 +102,27 @@ Client ────────────────────────�
 
 ---
 
-## Phase 5: Client — PENDING
+## Phase 5: Client Library + Test Binary — COMPLETE
 
-**Goal:** CLI binary streaming from mic or file, displaying real-time transcription.
+**What was built:**
+- **Client library** (`rhino-client`): `AsrClient` (connect via PeerInfo JSON file, create/destroy sessions), `AudioSender` (accepts audio at any sample rate, resamples to 16kHz via rubato `SincFixedIn`, buffers into 100ms/1600-sample chunks, auto-sequences), `EventStream` (yields `AsrEvent`, hides velo `StreamAnchor`/`StreamFrame` internals). `AsrSession` struct with split `audio`/`events` for concurrent task use. `from_velo()` constructor for in-process testing.
+- **Test binary** (`rhino-test-client`): reads WAV file via hound (i16/f32, stereo→mono), sends audio through library with optional real-time pacing, prints events via TextBuffer with ANSI overwrite for TTY.
+- **Server update**: clap CLI with `--connect-file` (default `/tmp/rhino-server.json`) and `--bind` args. Writes `PeerInfo` JSON on startup, cleans up on shutdown.
+- **Pipeline fix**: `flush_utterance()` now emits `EndOfUtterance` when buffer was fully trimmed but audio was processed (checks `trim_offset > 0` in addition to buffer non-empty).
+- 3 integration tests (session lifecycle, resampling 48kHz→16kHz, explicit destroy). Total workspace: 56 tests.
 
-- `--input mic|file`, `--file <path>`, `--server <addr>`, `--language <lang>`
-- Builds Velo instance, creates event anchor, calls create_session, attaches audio sender
-- Two tasks: audio sender (cpal/file + rubato resample) + event receiver (TextBuffer display)
-- No client-side VAD
+---
+
+## Phase 5.1: Axum Web Service + WASM Frontend — PENDING
+
+**Goal:** Browser-based streaming transcription via Axum + WASM.
+
+- **Axum service**: hosts WASM app, accepts WebSocket connections, bridges WebSocket ↔ client library ↔ ASR server, manages per-connection ASR sessions
+- **WASM app**: file drop (upload audio, see streaming transcription) + mic capture (browser MediaStream → live transcription in browser)
 
 ### Verification
-- Manual: server with mock backend + client with file input
-- Automated: integration test in-process
+- Open browser, drop audio file, see streaming transcription
+- Click record, speak, see live transcription
 
 ---
 
@@ -125,6 +134,17 @@ Client ────────────────────────�
 - Latency: audio chunk → committed word event
 - Error recovery: client disconnect, server restart
 - README with build/run instructions
+
+---
+
+## Phase 7: macOS Native App — PENDING
+
+**Goal:** Global-keybind macOS app for system-wide voice-to-text.
+
+- Single global keybind to start audio recording
+- Escape to close the stream
+- Output text placed at the active cursor position
+- Uses client library for ASR server communication
 
 ---
 

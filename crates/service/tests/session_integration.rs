@@ -176,15 +176,41 @@ fn session_lifecycle() {
         // Collect all events.
         let events = collect_events(&mut event_anchor).await;
 
-        let has_interim = events.iter().any(|e| matches!(e, AsrEvent::Interim { .. }));
-        let has_commit = events.iter().any(|e| matches!(e, AsrEvent::Commit { .. }));
-        let has_eou = events.iter().any(|e| matches!(e, AsrEvent::EndOfUtterance));
-        let has_retract = events.iter().any(|e| matches!(e, AsrEvent::Retract { .. }));
-
-        assert!(has_interim, "should have interim events: {events:?}");
-        assert!(has_commit, "should have commit events: {events:?}");
-        assert!(has_eou, "should have EndOfUtterance: {events:?}");
-        assert!(!has_retract, "should not retract with stable words: {events:?}");
+        // Verify event ordering contract:
+        // 1. Interims come before any Commit (first observation, agreement < k)
+        // 2. At least one Commit (agreement reaches k)
+        // 3. No Retract (stable mock words don't change)
+        // 4. EndOfUtterance is always the last event (natural close → flush)
+        assert!(
+            !events.is_empty(),
+            "should produce events"
+        );
+        assert!(
+            matches!(events.last(), Some(AsrEvent::EndOfUtterance)),
+            "last event must be EndOfUtterance on natural close: {events:?}"
+        );
+        let first_commit_idx = events
+            .iter()
+            .position(|e| matches!(e, AsrEvent::Commit { .. }));
+        let first_interim_idx = events
+            .iter()
+            .position(|e| matches!(e, AsrEvent::Interim { .. }));
+        assert!(
+            first_interim_idx.is_some(),
+            "should have interim events: {events:?}"
+        );
+        assert!(
+            first_commit_idx.is_some(),
+            "should have commit events: {events:?}"
+        );
+        assert!(
+            first_interim_idx.unwrap() < first_commit_idx.unwrap(),
+            "first interim should precede first commit: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AsrEvent::Retract { .. })),
+            "should not retract with stable words: {events:?}"
+        );
 
         // Session loop should have self-cleaned from the map after natural completion.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -237,8 +263,12 @@ fn destroy_session_without_audio() {
         assert!(destroy_response.success);
         assert_eq!(manager.session_count(), 0);
 
-        // Event stream should terminate cleanly.
-        let _events = collect_events(&mut event_anchor).await;
+        // Destroy = abort: event stream terminates without flush/EndOfUtterance.
+        let events = collect_events(&mut event_anchor).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, AsrEvent::EndOfUtterance)),
+            "destroy must not emit EndOfUtterance: {events:?}"
+        );
     });
 }
 
@@ -298,9 +328,13 @@ fn destroy_during_active_audio() {
         assert!(destroy_response.success);
         assert_eq!(manager.session_count(), 0);
 
-        // Event stream should terminate. May contain partial events from
-        // chunks processed before cancellation.
-        let _events = collect_events(&mut event_anchor).await;
+        // Destroy = abort: may contain partial events from chunks processed
+        // before cancellation, but must NOT have EndOfUtterance (no flush).
+        let events = collect_events(&mut event_anchor).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, AsrEvent::EndOfUtterance)),
+            "destroy must not emit EndOfUtterance even with in-flight audio: {events:?}"
+        );
     });
 }
 

@@ -51,6 +51,7 @@ impl TextBuffer {
     pub fn display(&self) -> String {
         let committed = self.committed.join(" ");
         match &self.interim {
+            Some(i) if committed.is_empty() => format!("[{i}]"),
             Some(i) => format!("{committed} [{i}]"),
             None => committed,
         }
@@ -127,6 +128,15 @@ mod tests {
         buf.apply(&AsrEvent::EndOfUtterance);
         assert!(buf.interim().is_none());
         assert_eq!(buf.display(), "");
+    }
+
+    #[test]
+    fn interim_only_no_leading_space() {
+        let mut buf = TextBuffer::new();
+        buf.apply(&AsrEvent::Interim {
+            text: "thinking".into(),
+        });
+        assert_eq!(buf.display(), "[thinking]");
     }
 
     #[test]
